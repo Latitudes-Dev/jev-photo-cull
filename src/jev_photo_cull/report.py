@@ -50,6 +50,7 @@ def _write_csv(report: dict[str, Any], path: Path) -> None:
         "heuristic_confidence",
         "model_label",
         "model_confidence",
+        "model_confidence_raw",
         "probabilities",
         "heuristic_probabilities",
         "model_probabilities",

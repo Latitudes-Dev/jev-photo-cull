@@ -12,7 +12,7 @@ rejected. This module builds that body; it does not talk to the network.
 from __future__ import annotations
 
 import base64
-from typing import Any
+from typing import Any, NamedTuple
 
 from jev_photo_cull.heuristics import LABELS
 from jev_photo_cull.records import ImageRecord
@@ -26,6 +26,10 @@ QUALITY_CRITERIA: dict[str, str] = {
 }
 
 MAX_IMAGES_PER_REQUEST = 4
+
+# Cache entries from before this version stored Clef's ``confidence`` field.
+# That field is not the probability of the chosen class, so those entries must miss.
+DECISION_SCORE_VERSION = "pchoice-v1"
 
 
 def encode_image(jpeg: bytes, image_format: str) -> str | dict[str, str]:
@@ -128,8 +132,36 @@ def build_keeper_request(
     }
 
 
-def parse_choice(answer: object, *, expected_options: set[str]) -> tuple[str, float, dict[str, float], bool]:
-    """Return choice, confidence, probabilities, and whether the model abstained."""
+class ParsedChoice(NamedTuple):
+    """Choice answer split into the combine score and the raw confidence field.
+
+    ``score`` is ``probabilities[choice]``, or ``max(probabilities)`` when the
+    chosen class has no entry. ``confidence_raw`` is Clef's separate
+    ``confidence`` statistic and is ``None`` when the payload omits it.
+    """
+
+    choice: str
+    score: float
+    confidence_raw: float | None
+    probabilities: dict[str, float]
+    abstained: bool
+
+
+def chosen_class_probability(probabilities: dict[str, float], choice: str | None) -> float:
+    """Probability of the class the model selected.
+
+    Clef's ``confidence`` is a different statistic and is not used here.
+    When ``choice`` is missing from the map, the largest probability is used.
+    """
+    if choice is not None and choice in probabilities:
+        return float(probabilities[choice])
+    if not probabilities:
+        raise ValueError("choice answer is missing probabilities")
+    return float(max(probabilities.values()))
+
+
+def parse_choice(answer: object, *, expected_options: set[str]) -> ParsedChoice:
+    """Return the chosen option, its probability, the raw confidence, and abstention."""
     if not isinstance(answer, dict):
         raise ValueError("decision answer was not an object")
     if answer.get("type") not in (None, "choice"):
@@ -139,19 +171,23 @@ def parse_choice(answer: object, *, expected_options: set[str]) -> tuple[str, fl
         raise ValueError("choice answer is missing probabilities")
     probabilities = {str(key): float(value) for key, value in raw_probs.items()}
     choice = answer.get("choice")
-    if not isinstance(choice, str) or choice not in probabilities:
+    if not isinstance(choice, str) or not choice:
         raise ValueError("choice answer has no known choice")
     if expected_options and choice not in expected_options and choice not in probabilities:
         raise ValueError(f"unexpected choice {choice!r}")
-    confidence = answer.get("confidence")
-    if confidence is None:
-        confidence = probabilities[choice]
-    confidence_value = float(confidence)
+    raw_confidence = answer.get("confidence")
+    confidence_raw = None if raw_confidence is None else float(raw_confidence)
     unknown_probability = answer.get("unknown_probability")
     abstained = bool(answer.get("abstained")) or choice == "abstain"
     if isinstance(unknown_probability, (int, float)) and float(unknown_probability) >= 0.5:
         abstained = True
-    return choice, confidence_value, probabilities, abstained
+    return ParsedChoice(
+        choice,
+        chosen_class_probability(probabilities, choice),
+        confidence_raw,
+        probabilities,
+        abstained,
+    )
 
 
 def options_for_labels() -> set[str]:

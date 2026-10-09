@@ -14,11 +14,17 @@ from jev_photo_cull.backends.clef import (
 )
 from jev_photo_cull.backends.local import LocalBackend, encode_multipart
 from jev_photo_cull.cache import DecisionCache
-from jev_photo_cull.decisions import build_quality_request, encode_image
+from jev_photo_cull.cli import main
+from jev_photo_cull.combine import combine_keeper, combine_quality
+from jev_photo_cull.decisions import build_quality_request, chosen_class_probability, encode_image, parse_choice
 from jev_photo_cull.errors import ConfigError, PhotoCullError
 from jev_photo_cull.rate_limit import RateLimiter
 from jev_photo_cull.records import ImageRecord
+from jev_photo_cull.scan import run_scan
+from jev_photo_cull.verdicts import KeeperVerdict, QualityVerdict
 from tests.library import sharp_scene
+
+_QUALITY_LABELS = ("clean", "blurry", "too_dark", "overexposed", "unknown")
 
 
 def _jpeg_record(name: str, label_hint: str = "clean") -> ImageRecord:
@@ -71,6 +77,152 @@ def _quality_answer(label: str) -> dict:
         "confidence": 0.92,
         "probabilities": probabilities,
     }
+
+
+def _recorded_answer(choice: str, probability: float, confidence: float) -> dict:
+    probabilities = {name: 0.02 for name in _QUALITY_LABELS}
+    probabilities[choice] = probability
+    return {
+        "type": "choice",
+        "choice": choice,
+        "probabilities": probabilities,
+        "confidence": confidence,
+    }
+
+
+def _recorded_envelope(
+    choice: str,
+    probability: float,
+    confidence: float,
+    input_tokens: int = 510,
+) -> bytes:
+    """Workers AI envelope around a real Clef result shape.
+
+    ``confidence`` here is the separate statistic (median about 0.62 on a live
+    run). The decision score is ``probabilities[choice]``. ``output_tokens`` is
+    present and always 0; cost accounting must not use it.
+    """
+    result = {
+        "model": "clef-flash",
+        "answers": {
+            "quality_0": _recorded_answer(choice, probability, confidence),
+        },
+        "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+    }
+    return json.dumps(
+        {"success": True, "errors": [], "messages": [], "result": result}
+    ).encode()
+
+
+def test_chosen_class_probability_ignores_the_confidence_field():
+    probabilities = {"clean": 0.04, "blurry": 0.83, "too_dark": 0.05, "overexposed": 0.04, "unknown": 0.04}
+    assert chosen_class_probability(probabilities, "blurry") == 0.83
+    assert chosen_class_probability(probabilities, "not-listed") == 0.83
+    parsed = parse_choice(
+        {
+            "type": "choice",
+            "choice": "blurry",
+            "probabilities": {"clean": 0.10, "too_dark": 0.83},
+            "confidence": 0.15,
+        },
+        expected_options=set(_QUALITY_LABELS),
+    )
+    assert parsed.choice == "blurry"
+    assert parsed.score == 0.83
+    assert parsed.confidence_raw == 0.15
+
+
+def test_recorded_response_lets_clef_override_and_sums_neurons(tmp_path):
+    """Live shape: confidence is not probabilities[choice], and neurons are a header."""
+    calls = {"n": 0}
+
+    def post(url, headers, payload, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            choice, probability, confidence = "blurry", 0.91, 0.62
+            header = {"cf-ai-neurons": "4.2"}
+        else:
+            choice, probability, confidence = "blurry", 0.80, 0.55
+            header = {"CF-AI-Neurons": "4.2"}
+        return 200, header, _recorded_envelope(choice, probability, confidence, input_tokens=510)
+
+    backend = ClefBackend(
+        cache=DecisionCache(tmp_path / "cache.json"),
+        requests_per_minute=0,
+        environ={"CLOUDFLARE_ACCOUNT_ID": "acc", "CLOUDFLARE_API_TOKEN": "t"},
+        post=post,
+    )
+    high = backend.classify([_jpeg_record("high.jpg", "high")])["high.jpg"]
+    close = backend.classify([_jpeg_record("close.jpg", "close")])["close.jpg"]
+    assert high.label == "blurry"
+    assert high.confidence == pytest.approx(0.91)
+    assert high.confidence_raw == pytest.approx(0.62)
+    assert close.confidence == pytest.approx(0.80)
+    assert close.confidence_raw == pytest.approx(0.55)
+    # The raw 0.62 field would lose to a heuristic of 0.89. The chosen-class
+    # probability 0.91, plus the 0.10 margin, overrides it without a review.
+    heuristic = QualityVerdict(label="clean", probabilities={"clean": 0.89}, confidence=0.89)
+    overridden = combine_quality(heuristic, high, review_below=0.6)
+    assert overridden.label == "blurry"
+    assert overridden.needs_review is False
+    reviewed = combine_quality(heuristic, close, review_below=0.6)
+    assert reviewed.label == "blurry"
+    assert reviewed.needs_review is True
+    assert backend.usage == {"calls": 2, "neurons": 8.4, "input_tokens": 1020}
+    again = backend.classify([_jpeg_record("high.jpg", "high")])
+    assert again["high.jpg"].confidence_raw == pytest.approx(0.62)
+    assert backend.usage["calls"] == 2
+
+    keeper = combine_keeper(
+        KeeperVerdict(keeper_path="a.jpg", probabilities={"shot_1": 0.89}, confidence=0.89, abstained=False),
+        KeeperVerdict(
+            keeper_path="b.jpg",
+            probabilities={"shot_2": 0.91},
+            confidence=0.91,
+            abstained=False,
+            confidence_raw=0.62,
+        ),
+        review_below=0.6,
+    )
+    assert keeper is not None
+    assert keeper.keeper_path == "b.jpg"
+    assert keeper.needs_review is False
+
+
+def test_scan_report_records_usage_and_raw_confidence(tmp_path, monkeypatch, capsys):
+    library = tmp_path / "photos"
+    library.mkdir()
+    sharp_scene().save(library / "one.jpg", format="JPEG", quality=85)
+    output = tmp_path / "out"
+
+    def post(url, headers, payload, timeout):
+        return 200, {"cf-ai-neurons": "4.2"}, _recorded_envelope("blurry", 0.91, 0.62, input_tokens=510)
+
+    report = run_scan(
+        library,
+        output,
+        backend="clef",
+        requests_per_minute=0,
+        environ={"CLOUDFLARE_ACCOUNT_ID": "acc", "CLOUDFLARE_API_TOKEN": "t"},
+        post=post,
+    )
+    assert report["usage"] == {"calls": 1, "neurons": 4.2, "input_tokens": 510}
+    image = report["images"][0]
+    assert image["model_label"] == "blurry"
+    assert image["model_confidence"] == pytest.approx(0.91)
+    assert image["model_confidence_raw"] == pytest.approx(0.62)
+    saved = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert saved["usage"] == {"calls": 1, "neurons": 4.2, "input_tokens": 510}
+    header = (output / "report.csv").read_text(encoding="utf-8").splitlines()[0]
+    assert "model_confidence_raw" in header.split(",")
+
+    def fake_scan(*args, **kwargs):
+        return report
+
+    monkeypatch.setattr("jev_photo_cull.cli.run_scan", fake_scan)
+    code = main(["scan", str(library), "--out", str(output), "--backend", "clef"])
+    assert code == 0
+    assert "model usage: 1 calls, 4.2 neurons, 510 input tokens" in capsys.readouterr().err
 
 
 def test_workers_ai_url_matches_the_documented_path():

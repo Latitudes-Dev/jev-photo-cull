@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from jev_photo_cull import __version__
+from jev_photo_cull.combine import CLOSE_CALL_GAP, DEFAULT_MODEL_MARGIN
 from jev_photo_cull.errors import ConfigError, PhotoCullError
 from jev_photo_cull.scan import run_scan
 
@@ -41,6 +42,17 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--burst-hamming", type=int, default=16, help="Looser dHash distance when EXIF times are close")
     scan.add_argument("--burst-seconds", type=float, default=2.0, help="EXIF time window for bursts")
     scan.add_argument("--review-below", type=float, default=0.60, help="Confidence under this is flagged for review")
+    scan.add_argument(
+        "--model-margin",
+        type=float,
+        default=DEFAULT_MODEL_MARGIN,
+        help=(
+            "Added to the model's chosen-class probability before it is compared with "
+            "the heuristic confidence. A difference of "
+            f"{CLOSE_CALL_GAP:.2f} or less is a close call and is flagged for review "
+            "(default: %(default)s)"
+        ),
+    )
     scan.add_argument("--max-edge", type=int, default=512, help="Longest edge of JPEGs sent to a decision model")
     scan.add_argument("--requests-per-minute", type=float, default=30.0, help="Client-side cap on model requests")
     scan.add_argument("--timeout", type=float, default=120.0, help="Per-request timeout in seconds")
@@ -79,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
             burst_hamming=args.burst_hamming,
             burst_seconds=args.burst_seconds,
             review_below=args.review_below,
+            model_margin=args.model_margin,
             max_edge=args.max_edge,
             requests_per_minute=args.requests_per_minute,
             timeout=args.timeout,
@@ -106,6 +119,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"labels: {labels or 'none'}", file=sys.stderr)
     print(f"needs review: {summary['needs_review']}", file=sys.stderr)
+    usage = report.get("usage") or {}
+    if usage.get("calls"):
+        print(
+            f"model usage: {usage['calls']} calls, {usage['neurons']} neurons, "
+            f"{usage['input_tokens']} input tokens",
+            file=sys.stderr,
+        )
     print(f"wrote {report['output_dir']}/report.json", file=sys.stderr)
     print(f"wrote {report['output_dir']}/report.csv", file=sys.stderr)
     print(f"wrote {report['output_dir']}/review.html", file=sys.stderr)

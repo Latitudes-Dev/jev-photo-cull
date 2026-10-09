@@ -172,6 +172,10 @@ class ClefBackend:
     def calls(self) -> int:
         return self._client.calls
 
+    @property
+    def usage(self) -> dict[str, Any]:
+        return self._client.usage
+
     def classify(self, records: list) -> dict:
         return self._client.classify(records)
 

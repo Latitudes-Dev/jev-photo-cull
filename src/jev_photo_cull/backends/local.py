@@ -21,9 +21,15 @@ from collections.abc import Callable
 from typing import Any
 
 from jev_photo_cull.backends.heuristics_backend import HeuristicsBackend
-from jev_photo_cull.backends.remote import DecisionClient, PostJson
+from jev_photo_cull.backends.remote import (
+    DecisionClient,
+    PostJson,
+    input_tokens_from_payload,
+    neurons_from_headers,
+)
 from jev_photo_cull.cache import DecisionCache
 from jev_photo_cull.decisions import (
+    DECISION_SCORE_VERSION,
     QUALITY_CRITERIA,
     build_quality_request,
     parse_choice,
@@ -139,6 +145,18 @@ class LocalBackend:
             self._post = post or _default_post
             self._limiter = RateLimiter(requests_per_minute, **({"sleep": sleep} if sleep else {}))
             self._imajev_calls = 0
+            self._imajev_neurons = 0.0
+            self._imajev_input_tokens = 0
+
+    @property
+    def usage(self) -> dict[str, Any]:
+        if self._client is not None:
+            return self._client.usage
+        return {
+            "calls": self._imajev_calls,
+            "neurons": round(self._imajev_neurons, 4),
+            "input_tokens": self._imajev_input_tokens,
+        }
 
     @property
     def calls(self) -> int:
@@ -177,15 +195,17 @@ class LocalBackend:
                     abstained=True,
                 )
                 continue
-            key = f"quality|imajev|{self.model_id}|{record.sha256}"
+            key = f"quality|imajev|{DECISION_SCORE_VERSION}|{self.model_id}|{record.sha256}"
             cached = self.cache.get(key)
             if isinstance(cached, dict):
+                raw_confidence = cached.get("confidence_raw")
                 verdicts[record.relative_path] = QualityVerdict(
                     label=str(cached["label"]),
                     probabilities={str(k): float(v) for k, v in cached["probabilities"].items()},
                     confidence=float(cached["confidence"]),
                     reasons=[str(reason) for reason in cached.get("reasons", [])],
                     abstained=bool(cached.get("abstained")),
+                    confidence_raw=None if raw_confidence is None else float(raw_confidence),
                 )
                 continue
             request = build_quality_request(self.model_id, [record], image_format="raw")
@@ -207,18 +227,21 @@ class LocalBackend:
                 )
             except urllib.error.URLError as exc:
                 raise self._unreachable(exc) from exc
+            self._imajev_neurons += neurons_from_headers(headers)
             payload = unwrap_local(status, headers, raw)
-            choice, confidence, probabilities, abstained = parse_choice(
+            self._imajev_input_tokens += input_tokens_from_payload(payload)
+            parsed = parse_choice(
                 payload["answers"].get("quality_0"),
                 expected_options=set(QUALITY_CRITERIA),
             )
-            label = "unknown" if abstained else choice
+            label = "unknown" if parsed.abstained else parsed.choice
             verdict = QualityVerdict(
                 label=label,
-                probabilities=probabilities,
-                confidence=confidence,
-                reasons=[f"imajev {self.model_id} chose {label}"],
-                abstained=abstained,
+                probabilities=parsed.probabilities,
+                confidence=parsed.score,
+                reasons=[f"imajev {self.model_id} chose {label} (p={parsed.score:.2f})"],
+                abstained=parsed.abstained,
+                confidence_raw=parsed.confidence_raw,
             )
             verdicts[record.relative_path] = verdict
             self.cache.put(
@@ -227,6 +250,7 @@ class LocalBackend:
                     "label": verdict.label,
                     "probabilities": verdict.probabilities,
                     "confidence": verdict.confidence,
+                    "confidence_raw": verdict.confidence_raw,
                     "reasons": verdict.reasons,
                     "abstained": verdict.abstained,
                 },

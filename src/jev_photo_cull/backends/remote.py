@@ -9,6 +9,7 @@ from typing import Any
 
 from jev_photo_cull.cache import DecisionCache
 from jev_photo_cull.decisions import (
+    DECISION_SCORE_VERSION,
     MAX_IMAGES_PER_REQUEST,
     QUALITY_CRITERIA,
     build_keeper_request,
@@ -62,6 +63,21 @@ class DecisionClient:
         self.sleep = sleep or __import__("time").sleep
         self.max_attempts = max_attempts
         self.calls = 0
+        self.neurons = 0.0
+        self.input_tokens = 0
+
+    @property
+    def usage(self) -> dict[str, Any]:
+        """HTTP attempts, summed ``cf-ai-neurons``, and summed ``usage.input_tokens``.
+
+        ``usage.output_tokens`` is ignored. Clef reports 0 for it.
+        Cached answers do not add to these totals.
+        """
+        return {
+            "calls": self.calls,
+            "neurons": round(self.neurons, 4),
+            "input_tokens": self.input_tokens,
+        }
 
     def classify(self, records: list[ImageRecord]) -> dict[str, QualityVerdict]:
         verdicts: dict[str, QualityVerdict] = {}
@@ -87,18 +103,17 @@ class DecisionClient:
             answers = _answers(payload)
             for index, record in enumerate(chunk):
                 answer = answers.get(f"quality_{index}")
-                choice, confidence, probabilities, abstained = parse_choice(
-                    answer, expected_options=set(QUALITY_CRITERIA)
-                )
-                label = "unknown" if abstained else choice
+                parsed = parse_choice(answer, expected_options=set(QUALITY_CRITERIA))
+                label = "unknown" if parsed.abstained else parsed.choice
                 if label not in QUALITY_CRITERIA:
                     raise PhotoCullError(f"model returned an unknown quality label {label!r}")
                 verdict = QualityVerdict(
                     label=label,
-                    probabilities=probabilities,
-                    confidence=confidence,
-                    reasons=[f"{self.name} {self.model} chose {label} (p={probabilities.get(label, confidence):.2f})"],
-                    abstained=abstained,
+                    probabilities=parsed.probabilities,
+                    confidence=parsed.score,
+                    reasons=[f"{self.name} {self.model} chose {label} (p={parsed.score:.2f})"],
+                    abstained=parsed.abstained,
+                    confidence_raw=parsed.confidence_raw,
                 )
                 verdicts[record.relative_path] = verdict
                 self.cache.put(self._quality_key(record), _verdict_to_cache(verdict))
@@ -137,34 +152,34 @@ class DecisionClient:
             payload = self._send(body)
             answers = _answers(payload)
             options = {f"shot_{index + 1}" for index in range(len(shown))} | {"abstain"}
-            choice, confidence, probabilities, abstained = parse_choice(
-                answers.get("keeper"), expected_options=options
-            )
-            gap = _top_gap(probabilities)
-            low_margin = gap < 0.12 and choice != "abstain"
-            if abstained or confidence < self.review_below or low_margin:
+            parsed = parse_choice(answers.get("keeper"), expected_options=options)
+            gap = _top_gap(parsed.probabilities)
+            low_margin = gap < 0.12 and parsed.choice != "abstain"
+            if parsed.abstained or parsed.score < self.review_below or low_margin:
                 verdict = KeeperVerdict(
                     keeper_path=None,
-                    probabilities=probabilities,
-                    confidence=confidence,
+                    probabilities=parsed.probabilities,
+                    confidence=parsed.score,
                     abstained=True,
                     reasons=[
                         f"{self.name} abstained on this group"
-                        if abstained
-                        else f"{self.name} keeper margin {gap:.2f} or confidence {confidence:.2f} is too low"
+                        if parsed.abstained
+                        else f"{self.name} keeper margin {gap:.2f} or confidence {parsed.score:.2f} is too low"
                     ],
                     needs_review=True,
+                    confidence_raw=parsed.confidence_raw,
                 )
             else:
-                index = int(choice.split("_", 1)[1]) - 1
+                index = int(parsed.choice.split("_", 1)[1]) - 1
                 keeper = shown[index]
                 verdict = KeeperVerdict(
                     keeper_path=keeper.relative_path,
-                    probabilities=probabilities,
-                    confidence=confidence,
+                    probabilities=parsed.probabilities,
+                    confidence=parsed.score,
                     abstained=False,
-                    reasons=[f"{self.name} keeps {keeper.relative_path} (p={probabilities.get(choice, confidence):.2f})"],
-                    needs_review=confidence < self.review_below,
+                    reasons=[f"{self.name} keeps {keeper.relative_path} (p={parsed.score:.2f})"],
+                    needs_review=parsed.score < self.review_below,
+                    confidence_raw=parsed.confidence_raw,
                 )
             verdicts[group.id] = verdict
             self.cache.put(cache_key, _keeper_to_cache(verdict))
@@ -179,6 +194,7 @@ class DecisionClient:
             self.calls += 1
             status, headers, raw = self.post(self.url, self.headers, body, self.timeout)
             last_status, last_body = status, raw
+            self.neurons += neurons_from_headers(headers)
             if status == 429 or status >= 500:
                 if attempt + 1 >= self.max_attempts:
                     break
@@ -186,7 +202,9 @@ class DecisionClient:
                 self.sleep(retry_after if retry_after is not None else delay)
                 delay = min(delay * 2, 30.0)
                 continue
-            return self.unwrap(status, headers, raw)
+            payload = self.unwrap(status, headers, raw)
+            self.input_tokens += input_tokens_from_payload(payload)
+            return payload
         detail = last_body.decode("utf-8", errors="replace")[:500]
         raise PhotoCullError(
             f"{self.name} request failed after {self.max_attempts} attempts "
@@ -195,14 +213,20 @@ class DecisionClient:
 
     def _quality_key(self, record: ImageRecord) -> str:
         jpeg_hash = hashlib.sha256(record.model_jpeg or b"").hexdigest()[:16]
-        return f"quality|{SCHEMA_TAG}|{self.name}|{self.model}|{self.image_format}|{record.sha256}|{jpeg_hash}"
+        return (
+            f"quality|{DECISION_SCORE_VERSION}|{SCHEMA_TAG}|{self.name}|{self.model}|"
+            f"{self.image_format}|{record.sha256}|{jpeg_hash}"
+        )
 
     def _keeper_key(self, records: list[ImageRecord]) -> str:
         parts = []
         for record in records:
             jpeg_hash = hashlib.sha256(record.model_jpeg or b"").hexdigest()[:12]
             parts.append(f"{record.sha256}:{jpeg_hash}")
-        return f"keeper|{SCHEMA_TAG}|{self.name}|{self.model}|{self.image_format}|{','.join(parts)}"
+        return (
+            f"keeper|{DECISION_SCORE_VERSION}|{SCHEMA_TAG}|{self.name}|{self.model}|"
+            f"{self.image_format}|{','.join(parts)}"
+        )
 
 
 def _chunks(items: list[ImageRecord], size: int) -> list[list[ImageRecord]]:
@@ -214,6 +238,39 @@ def _answers(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(answers, dict):
         raise PhotoCullError("decision response did not include an answers object")
     return answers
+
+
+def _header_value(headers: dict[str, str], name: str) -> str | None:
+    folded = name.lower()
+    for key, value in headers.items():
+        if key.lower() == folded:
+            return value
+    return None
+
+
+def neurons_from_headers(headers: dict[str, str]) -> float:
+    """Read the Workers AI ``cf-ai-neurons`` response header, case-insensitively."""
+    raw = _header_value(headers, "cf-ai-neurons")
+    if raw is None or not str(raw).strip():
+        return 0.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.0
+
+
+def input_tokens_from_payload(payload: dict[str, Any]) -> int:
+    """Sum only ``usage.input_tokens``. Clef's ``output_tokens`` is always 0."""
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return 0
+    raw = usage.get("input_tokens")
+    if raw is None:
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _retry_after(headers: dict[str, str]) -> float | None:
@@ -238,6 +295,7 @@ def _verdict_to_cache(verdict: QualityVerdict) -> dict[str, Any]:
         "label": verdict.label,
         "probabilities": verdict.probabilities,
         "confidence": verdict.confidence,
+        "confidence_raw": verdict.confidence_raw,
         "reasons": verdict.reasons,
         "abstained": verdict.abstained,
     }
@@ -250,6 +308,7 @@ def _verdict_from_cache(payload: dict[str, Any]) -> QualityVerdict:
         confidence=float(payload["confidence"]),
         reasons=[str(reason) for reason in payload.get("reasons", [])],
         abstained=bool(payload.get("abstained")),
+        confidence_raw=_optional_float(payload.get("confidence_raw")),
     )
 
 
@@ -261,6 +320,7 @@ def _keeper_to_cache(verdict: KeeperVerdict) -> dict[str, Any]:
         "abstained": verdict.abstained,
         "reasons": verdict.reasons,
         "needs_review": verdict.needs_review,
+        "confidence_raw": verdict.confidence_raw,
     }
 
 
@@ -273,4 +333,11 @@ def _keeper_from_cache(payload: dict[str, Any]) -> KeeperVerdict:
         abstained=bool(payload["abstained"]),
         reasons=[str(reason) for reason in payload.get("reasons", [])],
         needs_review=bool(payload.get("needs_review")),
+        confidence_raw=_optional_float(payload.get("confidence_raw")),
     )
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)

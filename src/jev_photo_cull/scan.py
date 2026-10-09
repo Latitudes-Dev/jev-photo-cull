@@ -12,7 +12,7 @@ from jev_photo_cull.backends.clef import ClefBackend, credentials_present, load_
 from jev_photo_cull.backends.heuristics_backend import HeuristicsBackend
 from jev_photo_cull.backends.local import LocalBackend
 from jev_photo_cull.cache import DecisionCache
-from jev_photo_cull.combine import combine_keeper, combine_quality, singleton_keep
+from jev_photo_cull.combine import DEFAULT_MODEL_MARGIN, combine_keeper, combine_quality, singleton_keep
 from jev_photo_cull.discover import discover_images
 from jev_photo_cull.errors import ConfigError
 from jev_photo_cull.grouping import GroupingConfig, group_records
@@ -52,6 +52,7 @@ def run_scan(
     burst_hamming: int = 16,
     burst_seconds: float = 2.0,
     review_below: float = 0.60,
+    model_margin: float = DEFAULT_MODEL_MARGIN,
     max_edge: int = 512,
     requests_per_minute: float = 30.0,
     timeout: float = 120.0,
@@ -102,6 +103,7 @@ def run_scan(
     model_quality: dict[str, QualityVerdict] | None = None
     model_keepers: dict[str, KeeperVerdict] | None = None
     model_name: str | None = None
+    usage: dict[str, Any] = {"calls": 0, "neurons": 0.0, "input_tokens": 0}
     cache = DecisionCache(destination / "cache" / "decisions.json", enabled=cache_enabled)
     if chosen == "clef":
         clef = ClefBackend(
@@ -118,6 +120,7 @@ def run_scan(
         model_quality = clef.classify(records)
         model_keepers = clef.choose_keepers(groups)
         model_name = clef.model_id
+        usage = dict(clef.usage)
     elif chosen == "local":
         local = LocalBackend(
             cache=cache,
@@ -136,6 +139,7 @@ def run_scan(
         model_quality = local.classify(records)
         model_keepers = local.choose_keepers(groups)
         model_name = local.model_id
+        usage = dict(local.usage)
 
     report = _assemble(
         source=source,
@@ -149,7 +153,9 @@ def run_scan(
         model_quality=model_quality,
         model_keepers=model_keepers,
         review_below=review_below,
+        model_margin=model_margin,
         heuristic_config=heuristic_config,
+        usage=usage,
     )
     thumbs = {record.relative_path: record.thumb_jpeg for record in records if record.thumb_jpeg}
     write_reports(report, destination, thumbs)
@@ -171,7 +177,9 @@ def _assemble(
     model_quality: dict[str, QualityVerdict] | None,
     model_keepers: dict[str, KeeperVerdict] | None,
     review_below: float,
+    model_margin: float,
     heuristic_config: HeuristicConfig,
+    usage: dict[str, Any],
 ) -> dict[str, Any]:
     by_path = {record.relative_path: record for record in records}
     images: list[dict[str, Any]] = []
@@ -180,7 +188,12 @@ def _assemble(
         heuristic_keeper = heuristic_keepers.get(group.id)
         model_keeper = None if model_keepers is None else model_keepers.get(group.id)
         keeper = (
-            combine_keeper(heuristic_keeper, model_keeper, review_below=review_below)
+            combine_keeper(
+                heuristic_keeper,
+                model_keeper,
+                review_below=review_below,
+                model_margin=model_margin,
+            )
             if group.size > 1
             else None
         )
@@ -193,7 +206,12 @@ def _assemble(
                 record,
                 heuristic,
                 model,
-                combine_quality(heuristic, model, review_below=review_below),
+                combine_quality(
+                    heuristic,
+                    model,
+                    review_below=review_below,
+                    model_margin=model_margin,
+                ),
             )
         keeper_label = None
         if keeper and keeper.keeper_path:
@@ -252,6 +270,11 @@ def _assemble(
                     "heuristic_confidence": round(heuristic.confidence, 4),
                     "model_label": None if model is None else model.label,
                     "model_confidence": None if model is None else round(model.confidence, 4),
+                    "model_confidence_raw": (
+                        None
+                        if model is None or model.confidence_raw is None
+                        else round(model.confidence_raw, 4)
+                    ),
                     "probabilities": {key: round(value, 4) for key, value in combined.probabilities.items()},
                     "heuristic_probabilities": {
                         key: round(value, 4) for key, value in heuristic.probabilities.items()
@@ -298,6 +321,12 @@ def _assemble(
         "output_dir": str(destination),
         "backend": backend,
         "model": model_name,
+        "model_margin": model_margin,
+        "usage": {
+            "calls": int(usage.get("calls", 0)),
+            "neurons": usage.get("neurons", 0.0),
+            "input_tokens": int(usage.get("input_tokens", 0)),
+        },
         "image_count": len(images),
         "summary": {
             "groups": len(group_payloads),

@@ -143,6 +143,7 @@ def test_cli_scan_and_missing_clef_credentials(tmp_path: Path, monkeypatch):
     )
     assert completed.returncode == 0, completed.stderr
     assert (output / "review.html").is_file()
+    assert "neurons" not in completed.stderr
 
     failed = subprocess.run(
         [sys.executable, "-m", "jev_photo_cull", "scan", str(library), "--out", str(tmp_path / "clef-out"), "--backend", "clef"],
@@ -165,10 +166,16 @@ def test_auto_backend_follows_credentials():
 
 def test_disagreement_is_flagged_for_review():
     heuristic = QualityVerdict(label="blurry", probabilities={"blurry": 0.8}, confidence=0.8)
+    # 0.70 plus the default 0.10 margin ties the heuristic: a close call.
+    # The model supplies the label, and the photo is flagged for review.
     model = QualityVerdict(label="clean", probabilities={"clean": 0.7}, confidence=0.7)
     combined = combine_quality(heuristic, model, review_below=0.6)
     assert combined.needs_review is True
-    assert combined.label == "blurry"
+    assert combined.label == "clean"
+    weak = QualityVerdict(label="clean", probabilities={"clean": 0.5}, confidence=0.5)
+    kept = combine_quality(heuristic, weak, review_below=0.6)
+    assert kept.label == "blurry"
+    assert kept.needs_review is False
     agreed = combine_quality(heuristic, QualityVerdict(label="blurry", probabilities={"blurry": 0.9}, confidence=0.9), review_below=0.6)
     assert agreed.label == "blurry"
     assert agreed.needs_review is False

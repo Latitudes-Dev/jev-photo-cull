@@ -69,9 +69,15 @@ Copies land in `cull/keepers/` and the relative paths are listed in `cull/keeper
 
 `--backend auto` (the default) picks `clef` when those credentials are present and `heuristics` otherwise.
 
-The two signals are merged. Agreement raises confidence. Disagreement, an `unknown` label, a model abstain, or confidence under `--review-below` (default 0.60) sets `needs_review`. Inside a group, the keeper is the frame both passes prefer. A tie on local scores among visually equivalent frames keeps the first path. If the winning frame's label is not `clean`, nothing in that group is marked `keep`.
+The two signals are merged on a comparable score. The heuristic score is its own confidence. The model score is the probability of the class it chose (`probabilities[choice]`, or the largest probability when that class is missing from the map). Clef's `confidence` field is a separate statistic and is not that probability. On a live set of 48 photos it had a median of 0.62 (range 0.15–0.88), while `max(probabilities)` had a median of 0.83 (range 0.46–0.95). Comparing the raw field with a heuristic confidence near 0.89 meant the model never changed a label.
 
-Model answers are cached under `<out>/cache/decisions.json`, keyed by file hash, the exact JPEG that would be sent, the backend, and the question text. A rerun skips cached images. `--no-cache` turns that off.
+`--model-margin` (default 0.10) is added to the chosen-class probability before the comparison. That offset is the calibration between the two scales: 0.83 plus 0.10 sits just under a typical heuristic confidence of 0.89, which is a close call. When the adjusted scores differ by more than 0.05, the higher one sets the label and does not force a review. When they are within 0.05, the higher adjusted score (the model, on a tie) still sets the label and `needs_review` is true. Agreement raises confidence and does not apply the margin. An `unknown` label, a model abstain, or a winning score under `--review-below` (default 0.60) also sets `needs_review`.
+
+Inside a group, the keeper is chosen with the same margin. A tie on local scores among visually equivalent frames keeps the first path. If the winning frame's label is not `clean`, nothing in that group is marked `keep`.
+
+`model_confidence` in the report is the chosen-class probability. `model_confidence_raw` keeps Clef's `confidence` field so the original number is not dropped.
+
+Model answers are cached under `<out>/cache/decisions.json`, keyed by file hash, the exact JPEG that would be sent, the backend, the question text, and the decision-score version. A rerun skips cached images. Caches written before the chosen-class score are ignored. `--no-cache` turns caching off.
 
 ## Clef (Cloudflare Workers AI)
 
@@ -108,7 +114,9 @@ The Workers AI REST API wraps model output as `{"success", "errors", "messages",
 
 Heuristics never leave the machine. The local backend talks only to the server you point it at.
 
-The clef backend uploads those downscaled JPEGs and the question text to Cloudflare Workers AI. It does not upload original files. Cloudflare's launch post says they do not read, store, or train on Workers AI requests or responses unless you opt into fine-tuning. That is their published claim; this tool cannot enforce it. Token use depends on image size. The published price is per million input tokens; a separate vision-token formula was not on the model page, which is why images are downscaled before they are sent. There is no live call in the test suite.
+The clef backend uploads those downscaled JPEGs and the question text to Cloudflare Workers AI. It does not upload original files. Cloudflare's launch post says they do not read, store, or train on Workers AI requests or responses unless you opt into fine-tuning. That is their published claim; this tool cannot enforce it. Images are downscaled before they are sent.
+
+A live Clef-flash run on real photos, downscaled to a 512 px long edge and including the keeper calls, used about 4.2 neurons and about 510 input tokens per photo. That is about 4,200 neurons per 1,000 photos. Neurons come from the `cf-ai-neurons` response header. `usage.output_tokens` is 0 for Clef and is not used. Every Workers AI response's `cf-ai-neurons` header is summed with `usage.input_tokens` and the HTTP call count into `report.json` under `usage`, and the CLI prints that line when any call was made. Cached hits are not counted again. The test suite replays a recorded response and does not call Cloudflare.
 
 ## Local backend
 
@@ -136,7 +144,9 @@ If an imajev answer sets `abstained` or `unknown_probability` ≥ 0.5, the label
 
 ## Report fields
 
-Each image row includes `path`, `sha256`, `perceptual_hash` (`dhash:` plus 16 hex digits), `group_id`, `group_size`, `group_kind` (`single`, `identical`, `near-duplicate`, `burst`, or `mixed`), `keep` (`true`, `false`, or empty/null), `label`, `confidence`, `needs_review`, heuristic and model labels and probabilities, exposure and sharpness `scores` (including the histogram), `backend`, `model`, `reasons`, `captured_at`, dimensions, and `error` when the file could not be read.
+Each image row includes `path`, `sha256`, `perceptual_hash` (`dhash:` plus 16 hex digits), `group_id`, `group_size`, `group_kind` (`single`, `identical`, `near-duplicate`, `burst`, or `mixed`), `keep` (`true`, `false`, or empty/null), `label`, `confidence`, `needs_review`, heuristic and model labels and probabilities, `model_confidence` (chosen-class probability) and `model_confidence_raw` (Clef's `confidence` field), exposure and sharpness `scores` (including the histogram), `backend`, `model`, `reasons`, `captured_at`, dimensions, and `error` when the file could not be read.
+
+The report also has `usage` with `calls`, `neurons`, and `input_tokens`, and `model_margin` for the calibration used on that run.
 
 `reasons` is a list of short measurement and decision notes, not a hidden chain of thought.
 
@@ -157,7 +167,7 @@ These are limits of what the docs showed on 2026-10-09, not guesses filled in as
 - Workers AI account rate limits for Clef were not on the model page. The client caps itself at 30 requests per minute and backs off on 429. Confirm the account limit before a large library.
 - The Clef Python sample prints `response.json()` and does not show the REST envelope. The client follows the usual Workers AI `/ai/run` envelope and also accepts a bare `{answers}` body. This was not executed against a live account.
 - The input schema allows a data URL or `{content_type, base64}`. The client sends the object form. That was not executed live.
-- Input-token accounting for vision, beyond the per-million-token price, was not specified.
+- A live Clef-flash sample measured about 4.2 neurons and about 510 input tokens per photo (512 px long edge, keeper calls included). The official vision-token formula, beyond the per-million-token price, was still not on the model page.
 - The Ollama card says images are raw base64 and that data URLs are rejected. The default local format follows that. It was not executed live.
 - imajev's README shows a single image part. Keeper selection in that mode does not send a second image.
 - Hosted System One documents a 32-question cap. The Workers AI Clef schema allows 64. This tool stays at or below 4 questions on a quality call.
